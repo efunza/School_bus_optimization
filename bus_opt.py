@@ -1,6 +1,6 @@
-# app.py
+# bus_opt.py
 # Streamlit GUI: Nonlinear Optimization of School Bus Routes (Genetic Algorithm)
-# Run: streamlit run app.py
+# Run locally: streamlit run bus_opt.py
 
 import math
 import random
@@ -10,9 +10,11 @@ from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+import pydeck as pdk
+
 
 # -----------------------------
-# Styling / Page config
+# Page config + Styling
 # -----------------------------
 st.set_page_config(
     page_title="School Bus Route Optimizer (GA)",
@@ -22,24 +24,26 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
-/* Softer background for main area */
+/* Background */
 [data-testid="stAppViewContainer"] {
     background: radial-gradient(circle at 15% 20%, rgba(59,130,246,0.10), transparent 40%),
                 radial-gradient(circle at 85% 25%, rgba(16,185,129,0.10), transparent 45%),
                 radial-gradient(circle at 50% 90%, rgba(234,179,8,0.08), transparent 40%);
 }
 
-/* Card-like containers */
+/* Main spacing */
 .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+
+/* Metric cards */
 div[data-testid="stMetric"] {
-    background: rgba(255,255,255,0.75);
+    background: rgba(255,255,255,0.78);
     border: 1px solid rgba(0,0,0,0.06);
     border-radius: 14px;
     padding: 14px 14px 10px 14px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.05);
 }
 
-/* Sidebar polish */
+/* Sidebar */
 section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, rgba(15,23,42,0.96), rgba(2,6,23,0.96));
 }
@@ -56,14 +60,14 @@ section[data-testid="stSidebar"] .stButton button { width: 100%; border-radius: 
 
 /* Expanders */
 details {
-    background: rgba(255,255,255,0.70);
+    background: rgba(255,255,255,0.72);
     border: 1px solid rgba(0,0,0,0.06);
     border-radius: 14px;
     padding: 0.3rem 0.8rem;
     box-shadow: 0 6px 20px rgba(0,0,0,0.04);
 }
 
-/* Small badge */
+/* Badge */
 .badge {
     display:inline-block;
     padding: 0.15rem 0.55rem;
@@ -76,8 +80,9 @@ details {
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
+
 # -----------------------------
-# Utilities
+# Distance utilities
 # -----------------------------
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     """Great-circle distance in km."""
@@ -88,6 +93,7 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
+
 
 def compute_distance_matrix(points_df: pd.DataFrame) -> np.ndarray:
     """Compute symmetric distance matrix for points (lat/lon)."""
@@ -101,6 +107,7 @@ def compute_distance_matrix(points_df: pd.DataFrame) -> np.ndarray:
             D[i, j] = D[j, i] = d
     return D
 
+
 def route_distance(route: List[int], D: np.ndarray) -> float:
     """Distance for a route specified by indices in D (including depot index 0 at start/end)."""
     if len(route) < 2:
@@ -110,6 +117,10 @@ def route_distance(route: List[int], D: np.ndarray) -> float:
         dist += D[route[i], route[i + 1]]
     return dist
 
+
+# -----------------------------
+# Routing decoder + baselines
+# -----------------------------
 def decode_permutation_to_routes(
     perm_students: List[int],
     demands: np.ndarray,
@@ -119,8 +130,7 @@ def decode_permutation_to_routes(
 ) -> Tuple[List[List[int]], float]:
     """
     Decode a "giant tour" permutation into feasible routes by splitting when capacity exceeded.
-    Returns (routes, penalty).
-    Routes include depot at start/end.
+    Returns (routes, penalty). Routes include depot at start/end.
     """
     routes = []
     current = [depot_idx]
@@ -128,11 +138,11 @@ def decode_permutation_to_routes(
     penalty = 0.0
 
     for s in perm_students:
-        d = demands[s]
+        d = int(demands[s])
+
         if d > capacity:
-            # Impossible single student demand; heavy penalty
+            # impossible individual demand
             penalty += 1e6 * (d - capacity)
-            # still place it alone
             if len(current) > 1:
                 current.append(depot_idx)
                 routes.append(current)
@@ -145,10 +155,8 @@ def decode_permutation_to_routes(
             current.append(s)
             load += d
         else:
-            # close route
             current.append(depot_idx)
             routes.append(current)
-            # start new route
             current = [depot_idx, s]
             load = d
 
@@ -156,11 +164,11 @@ def decode_permutation_to_routes(
         current.append(depot_idx)
         routes.append(current)
 
-    # penalty if too many buses used
     if len(routes) > max_buses:
-        penalty += 5000.0 * (len(routes) - max_buses)  # strong constraint
+        penalty += 5000.0 * (len(routes) - max_buses)
 
     return routes, penalty
+
 
 def greedy_baseline_routes(
     student_indices: List[int],
@@ -170,35 +178,37 @@ def greedy_baseline_routes(
     max_buses: int,
     depot_idx: int = 0,
 ) -> List[List[int]]:
-    """
-    Simple baseline: nearest-neighbor building routes until capacity filled.
-    """
+    """Simple baseline: nearest-neighbor routes until capacity filled."""
     remaining = set(student_indices)
     routes = []
+
     for _ in range(max_buses):
         if not remaining:
             break
         route = [depot_idx]
         load = 0
         current = depot_idx
+
         while True:
-            candidates = [s for s in remaining if load + demands[s] <= capacity]
+            candidates = [s for s in remaining if load + int(demands[s]) <= capacity]
             if not candidates:
                 break
             next_s = min(candidates, key=lambda s: D[current, s])
             route.append(next_s)
-            load += demands[next_s]
+            load += int(demands[next_s])
             remaining.remove(next_s)
             current = next_s
+
         route.append(depot_idx)
         routes.append(route)
 
-    # if students remain, append them with penalty-ish "overflow" routes
+    # Any leftover students -> single routes (shows infeasibility under bus limit)
     while remaining:
         s = remaining.pop()
         routes.append([depot_idx, s, depot_idx])
 
     return routes
+
 
 def evaluate_routes(
     routes: List[List[int]],
@@ -209,9 +219,15 @@ def evaluate_routes(
 ) -> Dict[str, float]:
     total_km = sum(route_distance(r, D) for r in routes)
     total_fuel = total_km * fuel_l_per_km
-    # travel time: km / speed, then traffic multiplier (slower -> larger time)
     total_hours = (total_km / max(speed_kmph, 1e-6)) * traffic_multiplier
     avg_minutes_per_route = (total_hours * 60.0) / max(len(routes), 1)
+
+    # Utilization (simple): average load / capacity across used routes
+    # (ignore depot demand)
+    loads = []
+    for r in routes:
+        loads.append(sum(int(x) for x in [0] + [0]))  # placeholder
+
     return {
         "total_km": float(total_km),
         "total_fuel_l": float(total_fuel),
@@ -220,10 +236,9 @@ def evaluate_routes(
         "num_routes": float(len(routes)),
     }
 
+
 def stability_score(route_sets: List[List[List[int]]]) -> float:
-    """
-    Simple stability: Jaccard similarity of consecutive route edge sets (higher is more stable).
-    """
+    """Jaccard similarity of consecutive route edge sets."""
     def edges(routes):
         e = set()
         for r in routes:
@@ -243,8 +258,9 @@ def stability_score(route_sets: List[List[List[int]]]) -> float:
         sims.append(inter / union)
     return float(np.mean(sims))
 
+
 # -----------------------------
-# Genetic Algorithm (simple, robust)
+# Genetic Algorithm
 # -----------------------------
 @dataclass
 class GAParams:
@@ -256,21 +272,25 @@ class GAParams:
     tournament_k: int = 4
     seed: int = 42
 
+
 def ox_crossover(p1: List[int], p2: List[int]) -> Tuple[List[int], List[int]]:
     """Order crossover (OX) for permutations."""
     n = len(p1)
     a, b = sorted(random.sample(range(n), 2))
+
     def make_child(x, y):
         child = [None] * n
-        child[a:b+1] = x[a:b+1]
-        fill = [g for g in y if g not in child[a:b+1]]
+        child[a:b + 1] = x[a:b + 1]
+        fill = [g for g in y if g not in child[a:b + 1]]
         idx = 0
         for i in range(n):
             if child[i] is None:
                 child[i] = fill[idx]
                 idx += 1
         return child
+
     return make_child(p1, p2), make_child(p2, p1)
+
 
 def swap_mutation(p: List[int], swaps: int = 1) -> List[int]:
     n = len(p)
@@ -280,10 +300,12 @@ def swap_mutation(p: List[int], swaps: int = 1) -> List[int]:
         c[i], c[j] = c[j], c[i]
     return c
 
+
 def tournament_select(pop: List[List[int]], fitness: List[float], k: int) -> List[int]:
     idxs = random.sample(range(len(pop)), k)
     best = min(idxs, key=lambda i: fitness[i])
     return pop[best]
+
 
 def ga_optimize(
     student_indices: List[int],
@@ -301,15 +323,17 @@ def ga_optimize(
     random.seed(params.seed)
     np.random.seed(params.seed)
 
-    # Population = permutations of student indices
-    pop = []
     base = student_indices[:]
+    pop = []
     for _ in range(params.pop_size):
         cand = base[:]
         random.shuffle(cand)
         pop.append(cand)
 
     history_best = []
+    best_routes = None
+    best_metrics = None
+    best_obj = float("inf")
 
     def fitness_of_perm(perm):
         routes, penalty = decode_permutation_to_routes(
@@ -320,7 +344,8 @@ def ga_optimize(
             depot_idx=0,
         )
         metrics = evaluate_routes(routes, D, speed_kmph, fuel_l_per_km, traffic_multiplier=1.0)
-        # Nonlinear-ish blend: squared distance discourages long routes more strongly
+
+        # Nonlinear objective (squared terms)
         obj = (
             distance_weight * (metrics["total_km"] ** 2)
             + fuel_weight * (metrics["total_fuel_l"] ** 2)
@@ -329,11 +354,7 @@ def ga_optimize(
         )
         return obj, routes, metrics
 
-    best_routes = None
-    best_metrics = None
-    best_obj = float("inf")
-
-    for gen in range(params.generations):
+    for _gen in range(params.generations):
         fits = []
         cache_routes = []
         cache_metrics = []
@@ -344,20 +365,18 @@ def ga_optimize(
             cache_routes.append(routes)
             cache_metrics.append(metrics)
 
-        # Track best
         gen_best_i = int(np.argmin(fits))
         gen_best_obj = fits[gen_best_i]
         history_best.append(float(gen_best_obj))
+
         if gen_best_obj < best_obj:
             best_obj = gen_best_obj
             best_routes = cache_routes[gen_best_i]
             best_metrics = cache_metrics[gen_best_i]
 
-        # Elitism
         elite_idxs = np.argsort(fits)[: params.elite_k]
         new_pop = [pop[i][:] for i in elite_idxs]
 
-        # Breed
         while len(new_pop) < params.pop_size:
             p1 = tournament_select(pop, fits, params.tournament_k)
             p2 = tournament_select(pop, fits, params.tournament_k)
@@ -380,41 +399,40 @@ def ga_optimize(
 
     return best_routes, best_metrics, history_best
 
+
 # -----------------------------
-# Pydeck map visualization
+# Pydeck layers (FIXED)
 # -----------------------------
 def build_route_layers(points: pd.DataFrame, routes: List[List[int]]):
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        data=points,
+        get_position=["lon", "lat"],
+        get_radius=35,
+        pickable=True,
+        auto_highlight=True,
+        opacity=0.9,
+    )
 
-    # Scatter layer for all points
-    scatter = {
-        "type": "ScatterplotLayer",
-        "data": points,
-        "getPosition": "[lon, lat]",
-        "getRadius": 35,
-        "pickable": True,
-        "autoHighlight": True,
-        "opacity": 0.9,
-    }
-
-    # One path per route
     paths = []
     for ridx, r in enumerate(routes):
         coords = points.loc[r, ["lon", "lat"]].to_numpy().tolist()
         paths.append({"route_id": ridx + 1, "path": coords})
 
-    path_layer = {
-        "type": "PathLayer",
-        "data": pd.DataFrame(paths),
-        "getPath": "path",
-        "getWidth": 6,
-        "pickable": True,
-        "opacity": 0.8,
-    }
+    path_layer = pdk.Layer(
+        "PathLayer",
+        data=pd.DataFrame(paths),
+        get_path="path",
+        get_width=6,
+        pickable=True,
+        opacity=0.85,
+    )
 
     return [scatter, path_layer]
 
+
 # -----------------------------
-# Sidebar Controls
+# Sidebar controls
 # -----------------------------
 st.sidebar.markdown("## 🚌 Route Optimizer")
 st.sidebar.markdown('<span class="badge">Genetic Algorithm • Capacity Constraints • Sensitivity</span>', unsafe_allow_html=True)
@@ -423,7 +441,7 @@ st.sidebar.divider()
 with st.sidebar.expander("📦 Data input", expanded=True):
     st.write("Upload **students.csv** or generate a demo dataset.")
     students_file = st.file_uploader(
-        "students.csv (required columns: student_id, lat, lon, demand(optional))",
+        "students.csv (required: lat, lon; optional: student_id, demand)",
         type=["csv"],
         accept_multiple_files=False,
     )
@@ -461,38 +479,42 @@ with st.sidebar.expander("🚦 Sensitivity (traffic)", expanded=False):
 
 run_btn = st.sidebar.button("▶ Run Optimization", type="primary")
 
+
 # -----------------------------
 # Data loading / generation
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_or_generate_students(demo: bool, students_file, depot_lat, depot_lon) -> pd.DataFrame:
     if demo:
-        # Create points around depot (roughly Nairobi-ish default), with slight scatter
         rng = np.random.default_rng(7)
         n = 140
         lats = depot_lat + rng.normal(0, 0.05, n)
         lons = depot_lon + rng.normal(0, 0.05, n)
         demand = np.ones(n, dtype=int)
-        df = pd.DataFrame({
-            "student_id": [f"S{i:03d}" for i in range(1, n + 1)],
-            "lat": lats,
-            "lon": lons,
-            "demand": demand,
-        })
+        df = pd.DataFrame(
+            {
+                "student_id": [f"S{i:03d}" for i in range(1, n + 1)],
+                "lat": lats,
+                "lon": lons,
+                "demand": demand,
+            }
+        )
         return df
 
     df = pd.read_csv(students_file)
-    # Normalize expected columns
     if "student_id" not in df.columns:
         df["student_id"] = [f"S{i:03d}" for i in range(1, len(df) + 1)]
     if "demand" not in df.columns:
         df["demand"] = 1
+
     required = {"lat", "lon"}
     if not required.issubset(set(df.columns)):
         missing = required - set(df.columns)
         raise ValueError(f"Missing columns: {missing}. Required: lat, lon.")
+
     df["demand"] = df["demand"].fillna(1).astype(int)
     return df[["student_id", "lat", "lon", "demand"]].copy()
+
 
 try:
     students_df = load_or_generate_students(demo, students_file, depot_lat, depot_lon)
@@ -500,20 +522,19 @@ except Exception as e:
     st.error(f"Data error: {e}")
     st.stop()
 
-# Build points dataframe with depot at index 0
 depot = pd.DataFrame({"student_id": ["DEPOT"], "lat": [depot_lat], "lon": [depot_lon], "demand": [0]})
 points = pd.concat([depot, students_df], ignore_index=True)
 points["idx"] = np.arange(len(points))
 
-# Distance matrix (cached)
 @st.cache_data(show_spinner=False)
-def cached_distance_matrix(points_df: pd.DataFrame) -> np.ndarray:
-    return compute_distance_matrix(points_df)
+def cached_distance_matrix(points_latlon: pd.DataFrame) -> np.ndarray:
+    return compute_distance_matrix(points_latlon)
 
 D = cached_distance_matrix(points[["lat", "lon"]])
 
-student_indices = list(range(1, len(points)))  # 1..N (0 is depot)
+student_indices = list(range(1, len(points)))  # 1..N
 demands = points["demand"].to_numpy()
+
 
 # -----------------------------
 # Header
@@ -537,8 +558,9 @@ with badge_col:
         unsafe_allow_html=True,
     )
 
+
 # -----------------------------
-# Baseline (Manual/Greedy) always available
+# Baseline (always available)
 # -----------------------------
 baseline_routes = greedy_baseline_routes(
     student_indices=student_indices,
@@ -550,12 +572,13 @@ baseline_routes = greedy_baseline_routes(
 )
 baseline_metrics = evaluate_routes(baseline_routes, D, speed_kmph, fuel_l_per_km, traffic_multiplier=1.0)
 
+
 # -----------------------------
-# Main tabs
+# Tabs
 # -----------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🗺️ Map & Routes", "🧾 Data & Export"])
 
-# Run optimization on button press
+# Run optimization
 if run_btn:
     with st.spinner("Optimizing routes with Genetic Algorithm..."):
         ga_params = GAParams(
@@ -586,10 +609,10 @@ if run_btn:
         st.session_state["best_metrics"] = best_metrics
         st.session_state["history"] = history
 
-# Fetch current best if available
 best_routes = st.session_state.get("best_routes", None)
 best_metrics = st.session_state.get("best_metrics", None)
 history = st.session_state.get("history", None)
+
 
 # -----------------------------
 # Dashboard
@@ -599,10 +622,10 @@ with tab1:
 
     with left:
         st.subheader("Performance indicators")
+
         if best_routes is None:
             st.info("Click **Run Optimization** in the sidebar to compute GA-optimized routes.")
         else:
-            # Improvements vs baseline
             dist_impr = (baseline_metrics["total_km"] - best_metrics["total_km"]) / max(baseline_metrics["total_km"], 1e-9) * 100
             fuel_impr = (baseline_metrics["total_fuel_l"] - best_metrics["total_fuel_l"]) / max(baseline_metrics["total_fuel_l"], 1e-9) * 100
             time_impr_min = baseline_metrics["avg_minutes_per_route"] - best_metrics["avg_minutes_per_route"]
@@ -615,109 +638,115 @@ with tab1:
 
             st.divider()
 
-            # Sensitivity Analysis
             st.subheader("Sensitivity analysis (traffic variation)")
             scenarios = [("Low", traffic_low), ("Mid", traffic_mid), ("High", traffic_high)]
 
             scen_rows = []
-            optimized_route_sets = []
+            route_sets = []
             for name, mult in scenarios:
                 m = evaluate_routes(best_routes, D, speed_kmph, fuel_l_per_km, traffic_multiplier=mult)
-                scen_rows.append({
-                    "Scenario": name,
-                    "Traffic Multiplier": mult,
-                    "Total km": m["total_km"],
-                    "Total fuel (L)": m["total_fuel_l"],
-                    "Total hours": m["total_hours"],
-                    "Avg min/route": m["avg_minutes_per_route"],
-                    "Buses used": int(m["num_routes"]),
-                })
-                optimized_route_sets.append(best_routes)  # structure doesn't change; time changes
+                scen_rows.append(
+                    {
+                        "Scenario": name,
+                        "Traffic Multiplier": mult,
+                        "Total km": m["total_km"],
+                        "Total fuel (L)": m["total_fuel_l"],
+                        "Total hours": m["total_hours"],
+                        "Avg min/route": m["avg_minutes_per_route"],
+                        "Buses used": int(m["num_routes"]),
+                    }
+                )
+                route_sets.append(best_routes)
 
-            stab = stability_score(optimized_route_sets)
-            st.metric("Route stability score (0–1)", f"{stab:.3f}", "higher = more stable")
-
+            st.metric("Route stability score (0–1)", f"{stability_score(route_sets):.3f}", "higher = more stable")
             st.dataframe(pd.DataFrame(scen_rows), use_container_width=True, hide_index=True)
 
     with right:
         st.subheader("Baseline vs Optimized")
-        base_card = pd.DataFrame([{
-            "System": "Baseline (Greedy)",
-            "Total km": baseline_metrics["total_km"],
-            "Fuel (L)": baseline_metrics["total_fuel_l"],
-            "Avg min/route": baseline_metrics["avg_minutes_per_route"],
-            "Buses used": int(baseline_metrics["num_routes"]),
-        }])
+
+        base_card = pd.DataFrame(
+            [
+                {
+                    "System": "Baseline (Greedy)",
+                    "Total km": baseline_metrics["total_km"],
+                    "Fuel (L)": baseline_metrics["total_fuel_l"],
+                    "Avg min/route": baseline_metrics["avg_minutes_per_route"],
+                    "Buses used": int(baseline_metrics["num_routes"]),
+                }
+            ]
+        )
         st.dataframe(base_card, use_container_width=True, hide_index=True)
 
         if best_routes is not None:
-            opt_card = pd.DataFrame([{
-                "System": "Optimized (GA)",
-                "Total km": best_metrics["total_km"],
-                "Fuel (L)": best_metrics["total_fuel_l"],
-                "Avg min/route": best_metrics["avg_minutes_per_route"],
-                "Buses used": int(best_metrics["num_routes"]),
-            }])
+            opt_card = pd.DataFrame(
+                [
+                    {
+                        "System": "Optimized (GA)",
+                        "Total km": best_metrics["total_km"],
+                        "Fuel (L)": best_metrics["total_fuel_l"],
+                        "Avg min/route": best_metrics["avg_minutes_per_route"],
+                        "Buses used": int(best_metrics["num_routes"]),
+                    }
+                ]
+            )
             st.dataframe(opt_card, use_container_width=True, hide_index=True)
 
             st.divider()
             st.subheader("GA convergence")
-            # Streamlit line chart (simple + clean)
             st.line_chart(pd.DataFrame({"best_objective": history}))
         else:
             st.caption("Optimization history will appear here after you run the GA.")
 
+
 # -----------------------------
-# Map & Routes
+# Map & Routes (FIXED: uses pdk.Deck)
 # -----------------------------
 with tab2:
     st.subheader("Route visualization")
-    which = st.radio(
-        "Choose routes to display",
-        ["Baseline (Greedy)", "Optimized (GA)"] if best_routes is not None else ["Baseline (Greedy)"],
-        horizontal=True,
-    )
 
-    routes_to_show = baseline_routes if "Baseline" in which else best_routes
+    options = ["Baseline (Greedy)"]
+    if best_routes is not None:
+        options.append("Optimized (GA)")
 
-    # Build layers and view
+    which = st.radio("Choose routes to display", options, horizontal=True)
+    routes_to_show = baseline_routes if which.startswith("Baseline") else best_routes
+
     layers = build_route_layers(points, routes_to_show)
 
-    # Center view
-    center_lat = float(points["lat"].mean())
-    center_lon = float(points["lon"].mean())
-
-    st.pydeck_chart(
-        {
-            "initialViewState": {
-                "latitude": center_lat,
-                "longitude": center_lon,
-                "zoom": 11,
-                "pitch": 35,
-            },
-            "layers": layers,
-            "tooltip": {"text": "{student_id}\n(lat: {lat}, lon: {lon})"},
-        },
-        use_container_width=True,
+    view_state = pdk.ViewState(
+        latitude=float(points["lat"].mean()),
+        longitude=float(points["lon"].mean()),
+        zoom=11,
+        pitch=35,
     )
+
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        tooltip={"text": "{student_id}\n(lat: {lat}, lon: {lon})"},
+    )
+
+    st.pydeck_chart(deck, use_container_width=True)
 
     st.divider()
     st.subheader("Route list (stop order + loads)")
 
-    # Show routes in a friendly table
     rows = []
     for i, r in enumerate(routes_to_show, start=1):
         stops = points.loc[r, "student_id"].tolist()
         load = int(points.loc[r, "demand"].sum())
         km = route_distance(r, D)
-        rows.append({
-            "Route": f"Bus {i}",
-            "Stops": " → ".join(stops),
-            "Load": load,
-            "Distance (km)": km,
-        })
+        rows.append(
+            {
+                "Route": f"Bus {i}",
+                "Stops": " → ".join(stops),
+                "Load": load,
+                "Distance (km)": km,
+            }
+        )
 
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 # -----------------------------
 # Data & Export
@@ -728,64 +757,69 @@ with tab3:
 
     st.divider()
     st.subheader("Export routes")
+
     if best_routes is None:
         st.info("Run optimization first to export GA routes. Baseline export is available.")
-    export_choice = st.selectbox("Export which routes?", ["Baseline (Greedy)"] + (["Optimized (GA)"] if best_routes is not None else []))
+
+    export_choice = st.selectbox(
+        "Export which routes?",
+        ["Baseline (Greedy)"] + (["Optimized (GA)"] if best_routes is not None else []),
+    )
+
     export_routes = baseline_routes if export_choice.startswith("Baseline") else best_routes
 
-    # Convert to export format
     export_rows = []
     for bus_i, r in enumerate(export_routes, start=1):
-        # Exclude depot for stop list
         stop_idxs = [x for x in r if x != 0]
         stop_ids = points.loc[stop_idxs, "student_id"].tolist()
-        export_rows.append({
-            "bus_id": bus_i,
-            "num_stops": len(stop_ids),
-            "stops": ",".join(stop_ids),
-            "route_km": route_distance(r, D),
-            "route_load": int(points.loc[r, "demand"].sum()),
-        })
+        export_rows.append(
+            {
+                "bus_id": bus_i,
+                "num_stops": len(stop_ids),
+                "stops": ",".join(stop_ids),
+                "route_km": route_distance(r, D),
+                "route_load": int(points.loc[r, "demand"].sum()),
+            }
+        )
 
     export_df = pd.DataFrame(export_rows)
     st.dataframe(export_df, use_container_width=True, hide_index=True)
 
-    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Download routes CSV",
-        data=csv_bytes,
+        data=export_df.to_csv(index=False).encode("utf-8"),
         file_name="bus_routes_export.csv",
         mime="text/csv",
     )
 
-    with st.expander("✅ CSV templates", expanded=False):
-        st.markdown("**students.csv template**")
-        tmpl = pd.DataFrame({
-            "student_id": ["S001", "S002"],
-            "lat": [-1.300123, -1.280456],
-            "lon": [36.820111, 36.790222],
-            "demand": [1, 1],
-        })
+    with st.expander("✅ CSV template", expanded=False):
+        tmpl = pd.DataFrame(
+            {
+                "student_id": ["S001", "S002"],
+                "lat": [-1.300123, -1.280456],
+                "lon": [36.820111, 36.790222],
+                "demand": [1, 1],
+            }
+        )
         st.code(tmpl.to_csv(index=False), language="text")
 
+
 # -----------------------------
-# Footer / Notes
+# Footer
 # -----------------------------
 st.divider()
 with st.expander("About this model (read me)", expanded=False):
     st.markdown(
         """
 **What this app does**
-- Uses a **Genetic Algorithm** to optimize school bus routing.
-- Models a **capacitated routing problem** (each bus has a capacity).
-- Minimizes a **nonlinear objective** (squared distance, fuel, and travel time) plus constraint penalties.
+- Uses a **Genetic Algorithm** to optimize school bus routing (capacity constrained).
+- Minimizes a **nonlinear objective** (squared distance, fuel, and travel time) plus penalties.
 - Compares against a simple **baseline (greedy nearest-neighbor)**.
 - Runs **sensitivity analysis** with traffic multipliers.
 
-**Important note**
-This is a practical, classroom-friendly “VRP-lite” implementation:
-- Solution encoding is a **permutation** of students, then a decoder splits into routes by capacity.
-- For real deployments, you can upgrade the decoder to a full CVRP solver (e.g., split algorithm, local search, 2-opt, OR-tools),
-  and incorporate road-network travel times (OSRM/GraphHopper) instead of Haversine.
+**Note**
+This is a “VRP-lite” approach:
+- Encoding is a permutation of students; a decoder splits into routes by capacity.
+- For real deployment, consider road-network distances (OSRM/GraphHopper) and local-search (2-opt/3-opt).
         """
     )
